@@ -40,7 +40,7 @@ CACHE_EXPIRATION = 300
 # FUNÇÕES UTILITÁRIAS OTIMIZADAS
 # =======================================================
 def api_post_with_backoff(url, headers, payload, timeout=10, max_retries=3, backoff_factor=2):
-    """API call otimizada com timeout menor"""
+    """Chamada de API com retentativas e backoff exponencial."""
     for attempt in range(max_retries):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -64,7 +64,7 @@ def api_post_with_backoff(url, headers, payload, timeout=10, max_retries=3, back
     return None
 
 def get_devices(force_update=False):
-    """Busca dispositivos com cache"""
+    """Busca lista de dispositivos com cache em memória."""
     global devices_cache, last_devices_update
     current_time = time.time()
 
@@ -88,7 +88,7 @@ def get_devices(force_update=False):
         return devices_cache if devices_cache else []
 
 def fetch_visitors_page(headers, payload, page_index, limit):
-    """Busca uma página específica de visitantes"""
+    """Busca uma página específica de visitantes."""
     offset = page_index * limit
     page_payload = {**payload, "pagination": {"offset": offset, "limit": limit}}
 
@@ -99,30 +99,47 @@ def fetch_visitors_page(headers, payload, page_index, limit):
     return page_data.get("payload", []) or page_data.get("data", []) or []
 
 def get_visitors_all(start_date=None, end_date=None, selected_store=None):
+    """Busca todos os visitantes de um período (usado para persistência em banco)."""
     if not start_date:
         start_date = datetime.now(brazil_tz).replace(hour=0, minute=0, second=0, microsecond=0)
     if not end_date:
         end_date = datetime.now(brazil_tz).replace(hour=23, minute=59, second=59, microsecond=999999)
+
     start_date = brazil_tz.localize(start_date) if start_date.tzinfo is None else start_date.astimezone(brazil_tz)
     end_date = brazil_tz.localize(end_date) if end_date.tzinfo is None else end_date.astimezone(brazil_tz)
+
     start_utc = start_date.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_utc = end_date.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     headers = {"X-API-Token": API_TOKEN}
     limit = 100
     all_visitors = []
-    base_payload = {"start": start_utc, "end": end_utc, "tracks": True, "pagination": {"offset": 0, "limit": limit}}
+
+    base_payload = {
+        "start": start_utc,
+        "end": end_utc,
+        "tracks": True,
+        "pagination": {"offset": 0, "limit": limit}
+    }
+
     data = api_post_with_backoff(API_VISITORS, headers, base_payload, timeout=8, max_retries=2)
     if not data:
         return []
+
     first_items = data.get("payload", []) or data.get("data", []) or []
     all_visitors.extend(first_items)
+
     total_reported = int((data.get("pagination", {}) or {}).get("total") or len(first_items))
     pages_count = (total_reported + limit - 1) // limit
+
     for page_index in range(1, pages_count):
         page_items = fetch_visitors_page(headers, base_payload, page_index, limit)
         all_visitors.extend(page_items)
+
+    # Filtro por loja (dispositivo)
     if selected_store and selected_store != "all":
         sid = str(selected_store)
+
         def visitor_has_device(v):
             if "device_id" in v and str(v["device_id"]) == sid:
                 return True
@@ -145,12 +162,15 @@ def get_visitors_all(start_date=None, end_date=None, selected_store=None):
                 except Exception:
                     continue
             return False
+
         all_visitors = [v for v in all_visitors if visitor_has_device(v)]
+
     return all_visitors
 
 def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sample_size=200):
     """
-    Busca visitantes de forma otimizada
+    Busca visitantes de forma otimizada para atualização de tela.
+    Usa amostragem quando o volume é muito grande para não travar o dashboard.
     """
     if not start_date:
         start_date = datetime.now(brazil_tz).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -167,7 +187,6 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
     limit = 100
     all_visitors = []
 
-    # Primeira página para pegar o total
     base_payload = {
         "start": start_utc,
         "end": end_utc,
@@ -189,11 +208,9 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
 
     print(f"[API] Total reportado: {total_reported} visitantes")
 
-    # Estratégia de busca baseada no tamanho dos dados
+    # Se o volume é pequeno, busca tudo. Se for grande, usa amostra.
     if total_reported <= 500:
-        # Busca todos os dados (até 500)
         pages_count = (total_reported + limit - 1) // limit
-
         print(f"[API] Buscando todos os {total_reported} visitantes em {pages_count} páginas...")
 
         for page_index in range(1, pages_count):
@@ -201,14 +218,11 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
             all_visitors.extend(page_items)
 
     else:
-        # Para grandes volumes, usa amostragem inteligente
         print(f"[API] Volume grande ({total_reported}), usando amostra de {sample_size} visitantes...")
 
-        # Busca páginas distribuídas para melhor representatividade
         sample_pages = min(5, (total_reported // limit) + 1)
         pages_to_fetch = [i for i in range(1, sample_pages)]
 
-        # Adiciona algumas páginas do final também
         if total_reported > limit * sample_pages:
             pages_to_fetch.extend([i for i in range((total_reported // limit) - 2, (total_reported // limit))])
 
@@ -216,21 +230,19 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
             page_items = fetch_visitors_page(headers, base_payload, page_index, limit)
             all_visitors.extend(page_items)
 
-            # Para se já temos amostra suficiente
             if len(all_visitors) >= sample_size:
                 all_visitors = all_visitors[:sample_size]
                 break
 
-    # Filtro por loja
+    # Filtro por loja (dispositivo)
     if selected_store and selected_store != "all":
         sid = str(selected_store)
+
         def visitor_has_device(v):
-            # possíveis formatos: v["device_id"], v["device"]["id"], v["devices"] = [id,...] ou [{'id':...}]
             if "device_id" in v and str(v["device_id"]) == sid:
                 return True
             if "device" in v and isinstance(v["device"], dict) and str(v["device"].get("id")) == sid:
                 return True
-            # lista 'devices'
             devices_field = v.get("devices") or v.get("device_ids") or []
             for d in devices_field:
                 try:
@@ -240,7 +252,6 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
                         return True
                 except Exception:
                     continue
-            # tracks with device_id
             tracks = v.get("tracks") or []
             for t in tracks:
                 try:
@@ -258,36 +269,39 @@ def get_visitors_fast(start_date=None, end_date=None, selected_store=None, sampl
     return all_visitors, total_reported
 
 def process_visitor_data(visitors, total_reported=None):
-    """Processa dados de visitantes de forma otimizada"""
+    """
+    Processa os visitantes e gera métricas agregadas.
+    As contagens por horário passam a usar a amostra real, sem redistribuir pelo total_reported.
+    """
     if not visitors:
         return empty_metrics()
 
     df = pd.DataFrame(visitors)
 
-    # Garantir que as colunas existam
+    # Garante que as colunas usadas existam
     for col in ["sex", "age", "start"]:
         if col not in df.columns:
             df[col] = pd.NA
 
     total_processed = len(df)
 
-    # Se temos amostra, escalonar para o total real
+    # Fator de escala para métricas que desejam aproximar o total reportado
     scale_factor = 1.0
     if total_reported and total_reported > total_processed:
         scale_factor = total_reported / total_processed
         print(f"[SCALE] Escalonando dados: {total_processed} -> {total_reported} (fator: {scale_factor:.2f})")
 
-    # Total de visitantes: usa sempre o total_reported quando fornecido
+    # Total de visitantes apresentado nos cards
     total_visitors = int(total_reported) if (total_reported is not None) else total_processed
 
-    # Média de idade sempre como inteiro
+    # Média de idade (inteiro)
     try:
         ages = pd.to_numeric(df["age"], errors="coerce").dropna()
         avg_age = int(round(float(ages.mean()))) if not ages.empty else 0
     except Exception:
         avg_age = 0
 
-    # Gênero: normaliza e aloca proporcionalmente
+    # Normalização de gênero
     def normalize_sex(val):
         s = str(val).strip().lower()
         if s in {"1", "male", "m"}:
@@ -309,7 +323,7 @@ def process_visitor_data(visitors, total_reported=None):
         total_men = 0
         total_women = 0
 
-    # Idade média
+    # Recalcula média de idade caso o bloco anterior falhe
     try:
         ages = pd.to_numeric(df["age"], errors="coerce").dropna()
         avg_age = int(round(float(ages.mean()))) if not ages.empty else 0
@@ -320,7 +334,7 @@ def process_visitor_data(visitors, total_reported=None):
     hourly_data = {}
     hourly_gender_visits = {"male": {}, "female": {}}
 
-    # Helper: aloca proporcionalmente preservando soma total
+    # Helper para alocação proporcional (usado em dias da semana)
     def allocate_proportional(total, raw_counts, keys):
         base = {k: 0 for k in keys}
         s = sum(raw_counts.values())
@@ -329,41 +343,47 @@ def process_visitor_data(visitors, total_reported=None):
         quotas = {k: (raw_counts.get(k, 0) / s) * total for k in keys}
         ints = {k: int(quotas[k]) for k in keys}
         remainder = total - sum(ints.values())
-        # Método das maiores frações
+        # Distribui o resto pelas maiores frações
         order = sorted(keys, key=lambda k: quotas[k] - ints[k], reverse=True)
         for i in range(remainder):
             ints[order[i]] += 1
         return ints
 
     try:
-        # Converter datas corretamente
+        # Conversão de datas para timezone Brasil
         df["start_dt_utc"] = pd.to_datetime(df["start"], errors="coerce", utc=True)
         df = df.dropna(subset=["start_dt_utc"])
 
         df["start_dt_brt"] = df["start_dt_utc"].dt.tz_convert(brazil_tz)
 
-        # Dias da semana
+        # Dias da semana (aqui ainda usa proporcional ao total_visitors)
         df["weekday_en"] = df["start_dt_brt"].dt.day_name()
         weekday_raw = df["weekday_en"].value_counts().to_dict()
         order_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         weekday_counts = allocate_proportional(total_visitors, weekday_raw, order_en)
 
-        # Horários (total)
+        # Horários (total) – agora baseado somente na contagem real da amostra,
+        # sem escalonar para o total_reported para não distorcer o gráfico.
         df["hour_brt"] = df["start_dt_brt"].dt.hour
-        hourly_raw_series = df["hour_brt"].value_counts()
-        hourly_raw = {f"{int(h):02d}:00": int(c) for h, c in hourly_raw_series.items()}
+        hourly_counts_raw = df["hour_brt"].value_counts().to_dict()
         all_hours = [f"{h:02d}:00" for h in range(24)]
-        hourly_data = allocate_proportional(total_visitors, hourly_raw, all_hours)
+        hourly_data = {
+            f"{h:02d}:00": int(hourly_counts_raw.get(h, 0))
+            for h in range(24)
+        }
 
-        # Horários por gênero — usa amostra por hora quando houver, senão aplica razão diária
+        # Horários por gênero – usa a mesma base de contagem real
         male_df = df[df["sex_norm"] == "male"]
         female_df = df[df["sex_norm"] == "female"]
 
-        male_hourly_raw = {f"{int(h):02d}:00": int(c) for h, c in male_df["hour_brt"].value_counts().items()}
-        female_hourly_raw = {f"{int(h):02d}:00": int(c) for h, c in female_df["hour_brt"].value_counts().items()}
+        male_hourly_raw = {
+            f"{int(h):02d}:00": int(c) for h, c in male_df["hour_brt"].value_counts().items()
+        }
+        female_hourly_raw = {
+            f"{int(h):02d}:00": int(c) for h, c in female_df["hour_brt"].value_counts().items()
+        }
 
         hourly_gender_visits = {"male": {}, "female": {}}
-        day_male_ratio = (total_men / total_visitors) if total_visitors > 0 else 0.0
 
         for h in all_hours:
             total_h = int(hourly_data.get(h, 0))
@@ -374,7 +394,8 @@ def process_visitor_data(visitors, total_reported=None):
             if raw_sum > 0:
                 male_ratio_h = raw_m / raw_sum
             else:
-                male_ratio_h = day_male_ratio
+                # Se não houver informação de gênero naquele horário, aplica razão diária
+                male_ratio_h = (total_men / total_visitors) if total_visitors > 0 else 0.0
 
             male_h = int(round(total_h * male_ratio_h))
             female_h = total_h - male_h
@@ -388,7 +409,7 @@ def process_visitor_data(visitors, total_reported=None):
         hourly_data = {}
         hourly_gender_visits = {"male": {}, "female": {}}
 
-    # Distribuição por idade
+    # Distribuição por faixa etária
     age_ranges = {"18-25": 0, "26-35": 0, "36-45": 0, "46-60": 0, "60+": 0}
 
     try:
@@ -409,7 +430,7 @@ def process_visitor_data(visitors, total_reported=None):
 
             age_counts[key] = age_counts.get(key, 0) + 1
 
-        # Escalonar se necessário
+        # Aplica escala apenas nas contagens de faixa etária, se houver necessidade
         if scale_factor > 1.0:
             age_ranges = {key: int(count * scale_factor) for key, count in age_counts.items()}
         else:
@@ -433,6 +454,7 @@ def process_visitor_data(visitors, total_reported=None):
     }
 
 def empty_metrics():
+    """Métrica vazia padrão para períodos sem dados."""
     return {
         "total_visitors": 0, "total_men": 0, "total_women": 0, "avg_age": 0, "weekday_visits": {},
         "gender_distribution": {"male": 0, "female": 0},
@@ -442,13 +464,19 @@ def empty_metrics():
     }
 
 def create_hourly_flow_chart(hourly_data):
-    """Cria gráfico de fluxo de pessoas por horário"""
+    """Cria gráfico de fluxo de pessoas por horário."""
     if not hourly_data:
         fig = go.Figure()
-        fig.add_annotation(text="Nenhum dado disponível para o período selecionado",
-                          xref="paper", yref="paper",
-                          x=0.5, y=0.5, xanchor='center', yanchor='middle',
-                          showarrow=False)
+        fig.add_annotation(
+            text="Nenhum dado disponível para o período selecionado",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            xanchor='center',
+            yanchor='middle',
+            showarrow=False
+        )
         fig.update_layout(
             xaxis_title="Horário",
             yaxis_title="Número de Visitantes",
@@ -514,14 +542,26 @@ def create_gender_hourly_flow_chart(hourly_gender_data):
     """Cria gráfico de fluxo por horário segmentado por gênero (intervalos de 1h)."""
     if not hourly_gender_data or (not hourly_gender_data.get("male") and not hourly_gender_data.get("female")):
         fig = go.Figure()
-        fig.add_annotation(text="Nenhum dado disponível para o período selecionado",
-                           xref="paper", yref="paper", x=0.5, y=0.5, xanchor='center', yanchor='middle', showarrow=False)
-        fig.update_layout(xaxis_title="Horário", yaxis_title="Número de Visitantes",
-                          margin=dict(l=20, r=20, t=40, b=20), plot_bgcolor='white', paper_bgcolor='white',
-                          hovermode='x unified')
+        fig.add_annotation(
+            text="Nenhum dado disponível para o período selecionado",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            xanchor='center',
+            yanchor='middle',
+            showarrow=False
+        )
+        fig.update_layout(
+            xaxis_title="Horário",
+            yaxis_title="Número de Visitantes",
+            margin=dict(l=20, r=20, t=40, b=20),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            hovermode='x unified'
+        )
         return fig
 
-    # Eixos como intervalos "HH:00 — HH+1:00"
     labels = [f"{h:02d}:00 — {((h+1) % 24):02d}:00" for h in range(24)]
     hours_keys = [f"{h:02d}:00" for h in range(24)]
 
@@ -584,9 +624,14 @@ def metric_card(title, value_id, icon_class, color_class):
     return dbc.Col([
         dbc.Card([
             dbc.CardBody([
-                html.Div([html.H3(title, className="text-white h6 mb-2"), html.H2("", id=value_id, className="text-white mb-0")]),
-                html.Div([html.I(className=f"{icon_class} fa-2x text-white")],
-                        style={"position": "absolute", "right": "20px", "top": "50%", "transform": "translateY(-50%)"})
+                html.Div([
+                    html.H3(title, className="text-white h6 mb-2"),
+                    html.H2("", id=value_id, className="text-white mb-0")
+                ]),
+                html.Div([
+                    html.I(className=f"{icon_class} fa-2x text-white")
+                ],
+                style={"position": "absolute", "right": "20px", "top": "50%", "transform": "translateY(-50%)"})
             ], style={"height": "100px", "position": "relative"})
         ], style={
             "backgroundColor": color_class,
@@ -600,9 +645,13 @@ def create_navbar():
             dbc.Container([
                 dbc.Row([
                     dbc.Col([
-                        dbc.Button(html.I(className="fas fa-bars"), id="menu-toggle",
-                                  className="menu-button me-2", n_clicks=0,
-                                  style={"border": "none", "background": "transparent"}),
+                        dbc.Button(
+                            html.I(className="fas fa-bars"),
+                            id="menu-toggle",
+                            className="menu-button me-2",
+                            n_clicks=0,
+                            style={"border": "none", "background": "transparent"}
+                        ),
                         html.Img(src="/assets/img/logo.png", height="50px", className="me-2"),
                         html.Div([
                             html.H4("Assaí Atacadista", className="text-white mb-0"),
@@ -658,12 +707,18 @@ def create_filters(devices_cache):
 
 def create_chart_card(title, chart_id):
     return dbc.Card([
-        dbc.CardHeader([html.H5(title, style={"color": "#004AAD", "fontWeight": "500", "margin": "0"})]),
-        dbc.CardBody([dcc.Graph(id=chart_id, config=graph_config)])
+        dbc.CardHeader([
+            html.H5(title, style={"color": "#004AAD", "fontWeight": "500", "margin": "0"})
+        ]),
+        dbc.CardBody([
+            dcc.Graph(id=chart_id, config=graph_config)
+        ])
     ])
+
 def dashboard_layout(devices_cache, side_menu):
     return html.Div([
-        side_menu, create_navbar(),
+        side_menu,
+        create_navbar(),
         dbc.Container([
             dbc.Row([
                 metric_card("Total de Visitantes", "total-visitors", "fas fa-users", "#004AAD"),
@@ -685,10 +740,11 @@ def dashboard_layout(devices_cache, side_menu):
         ], fluid=True, className="p-4")
     ])
 
-# Layout simples para a página de visitantes (substitui o import que estava faltando)
 def visitors_layout(devices_cache, side_menu):
+    """Layout simples para a página de lista de visitantes."""
     return html.Div([
-        side_menu, create_navbar(),
+        side_menu,
+        create_navbar(),
         dbc.Container([
             dbc.Row([
                 dbc.Col([
@@ -699,8 +755,8 @@ def visitors_layout(devices_cache, side_menu):
         ], fluid=True, className="p-4")
     ])
 
-# Layout simples para login (substitui o import que estava faltando)
 def login_layout():
+    """Layout simples da página de login."""
     return html.Div([
         dbc.Container([
             dbc.Row([
@@ -713,20 +769,19 @@ def login_layout():
     ])
 
 # =======================================================
-# LAYOUT PRINCIPAL COM IA
+# LAYOUT PRINCIPAL
 # =======================================================
 devices_cache = get_devices(force_update=True)
 
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
-    dcc.Store(id='dashboard-data'), 
-    dcc.Store(id='selected-store'), 
+    dcc.Store(id='dashboard-data'),
+    dcc.Store(id='selected-store'),
     dcc.Store(id='current-page', data=0),
-    dcc.Store(id='shared-devices', data=devices_cache), 
+    dcc.Store(id='shared-devices', data=devices_cache),
     dcc.Store(id='menu-state', data={'open': False}),
-    dcc.Interval(id='interval-component', interval=30*1000, n_intervals=0), 
+    dcc.Interval(id='interval-component', interval=30*1000, n_intervals=0),
 
-    # Filtros sempre presentes (evita erro de IDs inexistentes)
     html.Div(
         id='top-filters-container',
         children=create_filters(devices_cache),
@@ -735,16 +790,16 @@ app.layout = html.Div([
 
     html.Div(id='page-content'),
     html.Div(id="backdrop", style={"display": "none"}),
-    
-    # Botão flutuante da IA
+
+    # Botão flutuante do assistente
     html.Button(
         html.I(className="fas fa-robot"),
         id="ai-fab",
         className="ai-fab",
         title="Assistente IA - Pergunte sobre os dados"
     ),
-    
-    # Painel de chat da IA
+
+    # Painel de chat do assistente
     dbc.Offcanvas(
         [
             html.Div([
@@ -796,76 +851,86 @@ app.validation_layout = html.Div([
 ])
 
 # =======================================================
-# CALLBACKS CORRIGIDOS
+# CALLBACKS PRINCIPAIS
 # =======================================================
 @app.callback(
-    Output('menu-state', 'data', allow_duplicate=True), 
-    Input('menu-toggle', 'n_clicks'), 
-    State('menu-state', 'data'), 
+    Output('menu-state', 'data', allow_duplicate=True),
+    Input('menu-toggle', 'n_clicks'),
+    State('menu-state', 'data'),
     prevent_initial_call=True
 )
 def toggle_menu(menu_clicks, state):
-    if not menu_clicks: 
+    """Abre/fecha o menu lateral."""
+    if not menu_clicks:
         raise dash.exceptions.PreventUpdate
     is_open = bool((state or {}).get('open', False))
     return {'open': not is_open}
 
 @app.callback(
-    Output('menu-state', 'data', allow_duplicate=True), 
-    Input('url', 'pathname'), 
+    Output('menu-state', 'data', allow_duplicate=True),
+    Input('url', 'pathname'),
     prevent_initial_call=True
 )
-def close_menu_on_navigation(_pathname): 
+def close_menu_on_navigation(_pathname):
+    """Fecha o menu ao navegar para outra página."""
     return {'open': False}
 
 @app.callback(
-    Output('page-content', 'children'), 
+    Output('page-content', 'children'),
     [Input('url', 'pathname')]
 )
 def display_page(pathname):
+    """Renderiza o conteúdo de acordo com a rota."""
     side_menu = create_side_menu()
-    if pathname == '/visitors': 
+    if pathname == '/visitors':
         return visitors_layout(devices_cache, side_menu)
-    if pathname in ('/login', '/pages/login'): 
+    if pathname in ('/login', '/pages/login'):
         return login_layout()
     return dashboard_layout(devices_cache, side_menu)
 
-# Mostra/oculta os filtros conforme a rota atual
 @app.callback(
     Output('top-filters-container', 'style'),
     Input('url', 'pathname'),
     prevent_initial_call=False
 )
 def toggle_filters_visibility(pathname):
+    """Mostra os filtros apenas na página principal do dashboard."""
     if pathname in ('/', '/dashboard', ''):
         return {"display": "block"}
     return {"display": "none"}
 
 @app.callback(
-    [Output('total-visitors', 'children'), 
-     Output('total-men', 'children'), 
-     Output('total-women', 'children'),
-     Output('avg-age', 'children'), 
-     Output('weekly-visits-chart', 'figure'), 
-     Output('gender-distribution-chart', 'figure'),
-     Output('age-distribution-chart', 'figure'), 
-     Output('hourly-flow-chart', 'figure'),
-     Output('gender-hourly-flow-chart', 'figure'),
-     Output('dashboard-data', 'data')],
-    [Input('store-selector', 'value'), 
-     Input('date-picker', 'start_date'), 
-     Input('date-picker', 'end_date'),
-     Input('interval-component', 'n_intervals'), 
-     Input('url', 'pathname'), 
-     Input('apply-filters', 'n_clicks')]
+    [
+        Output('total-visitors', 'children'),
+        Output('total-men', 'children'),
+        Output('total-women', 'children'),
+        Output('avg-age', 'children'),
+        Output('weekly-visits-chart', 'figure'),
+        Output('gender-distribution-chart', 'figure'),
+        Output('age-distribution-chart', 'figure'),
+        Output('hourly-flow-chart', 'figure'),
+        Output('gender-hourly-flow-chart', 'figure'),
+        Output('dashboard-data', 'data')
+    ],
+    [
+        Input('store-selector', 'value'),
+        Input('date-picker', 'start_date'),
+        Input('date-picker', 'end_date'),
+        Input('interval-component', 'n_intervals'),
+        Input('url', 'pathname'),
+        Input('apply-filters', 'n_clicks')
+    ]
 )
 def update_dashboard_metrics_and_charts(selected_store, start_date, end_date, n_intervals, pathname, apply_clicks):
-    # Garante que só roda no dashboard. Evita erro e acelera navegação.
+    """
+    Atualiza cards e gráficos do dashboard.
+    Usa get_visitors_fast para a tela e dispara persistência completa em background.
+    """
     if pathname not in ('/', '/dashboard', ''):
         raise dash.exceptions.PreventUpdate
+
     start_time = time.time()
 
-    # Normaliza período com tratamento de erro robusto
     try:
         if not start_date or not end_date:
             start_dt = datetime.now(brazil_tz).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -877,7 +942,7 @@ def update_dashboard_metrics_and_charts(selected_store, start_date, end_date, n_
             except ValueError:
                 start_dt = datetime.strptime(str(start_date), "%Y-%m-%d")
                 end_dt = datetime.strptime(str(end_date), "%Y-%m-%d")
-            
+
             start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
             end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
             start_dt = brazil_tz.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(brazil_tz)
@@ -889,13 +954,12 @@ def update_dashboard_metrics_and_charts(selected_store, start_date, end_date, n_
 
     store_key = selected_store or "all"
 
-    # Busca dados com fallback robusto
     try:
         print(f"[UI] Buscando dados otimizados...")
         all_visitors, api_total = get_visitors_fast(start_dt, end_dt, store_key)
         metrics = process_visitor_data(all_visitors, api_total)
 
-        # Persistir dados (em background)
+        # Persistência em banco em uma thread separada, para não travar o dashboard
         try:
             if all_visitors:
                 def _persist(s_key, s_dt, e_dt):
@@ -916,7 +980,7 @@ def update_dashboard_metrics_and_charts(selected_store, start_date, end_date, n_
     except Exception as e:
         print(f"[UI] Falha na API: {e}. Usando fallback.")
         try:
-            # Aqui você chamaria sua função de banco de dados
+            # Exemplo: aqui entraria a leitura de agregados do banco
             # agg = get_aggregated_stats(store_key, start_dt.date(), end_dt.date())
             agg = empty_metrics()
         except Exception as e2:
@@ -930,7 +994,7 @@ def update_dashboard_metrics_and_charts(selected_store, start_date, end_date, n_
     return result
 
 def format_output(metrics):
-    """Formata a saída com os dados processados"""
+    """Formata a saída para os componentes do dashboard a partir das métricas em memória."""
     try:
         days_map = {
             "Monday": "Seg", "Tuesday": "Ter", "Wednesday": "Qua",
@@ -943,14 +1007,13 @@ def format_output(metrics):
         weekly_fig = px.bar(x=ordered_pt, y=ordered_vals, labels={'x': 'Dia da semana', 'y': 'Visitas'})
         weekly_fig.update_traces(marker_color='#004AAD')
         weekly_fig.update_layout(
-            margin=dict(l=20, r=20, t=20, b=20), 
-            xaxis_title=None, 
+            margin=dict(l=20, r=20, t=20, b=20),
+            xaxis_title=None,
             yaxis_title=None,
             plot_bgcolor='white',
             paper_bgcolor='white'
         )
 
-        # Ajuste proporcional para garantir consistência com o total
         total = int(metrics.get("total_visitors", 0) or 0)
         men_raw = int(metrics.get("total_men", 0) or 0)
         women_raw = int(metrics.get("total_women", 0) or 0)
@@ -970,7 +1033,6 @@ def format_output(metrics):
         )
         gender_fig.update_layout(margin=dict(l=20, r=20, t=20, b=20))
 
-        # Ordem fixa na faixa etária
         age_order = ["18-25", "26-35", "36-45", "46-60", "60+"]
         age_vals = [int(metrics["age_distribution"].get(cat, 0)) for cat in age_order]
         age_fig = px.bar(x=age_order, y=age_vals, labels={'x': 'Faixa etária', 'y': 'Visitas'})
@@ -984,7 +1046,6 @@ def format_output(metrics):
         hourly_fig = create_hourly_flow_chart(metrics.get("hourly_visits", {}))
         gender_hourly_fig = create_gender_hourly_flow_chart(metrics.get("hourly_gender_visits", {"male": {}, "female": {}}))
 
-        # Média de idade sempre inteira
         avg_age_display = int(round(float(metrics.get("avg_age", 0))))
 
         return (
@@ -997,14 +1058,17 @@ def format_output(metrics):
             age_fig,
             hourly_fig,
             gender_hourly_fig,
-            metrics  # dados para a IA
+            metrics
         )
     except Exception as e:
         print(f"Erro no format_output: {e}")
         return fallback_output()
 
 def format_output_from_db(agg):
-    """Fallback com dados do banco"""
+    """
+    Formata saída quando os dados vêm do banco.
+    Agora o gráfico por horário usa hourly_visits do agregado, se existir.
+    """
     try:
         days_map = {
             "Monday": "Seg", "Tuesday": "Ter", "Wednesday": "Qua",
@@ -1018,14 +1082,13 @@ def format_output_from_db(agg):
         weekly_fig = px.bar(x=ordered_pt, y=ordered_vals, labels={'x': 'Dia da semana', 'y': 'Visitas'})
         weekly_fig.update_traces(marker_color='#004AAD')
         weekly_fig.update_layout(
-            margin=dict(l=20, r=20, t=20, b=20), 
-            xaxis_title=None, 
+            margin=dict(l=20, r=20, t=20, b=20),
+            xaxis_title=None,
             yaxis_title=None,
             plot_bgcolor='white',
             paper_bgcolor='white'
         )
 
-        # Ajuste proporcional de gênero baseado no total do DB
         total = int(agg.get("total_visitors", 0) or 0)
         men_raw = int(agg.get("male", 0) or 0)
         women_raw = int(agg.get("female", 0) or 0)
@@ -1045,7 +1108,6 @@ def format_output_from_db(agg):
         )
         gender_fig.update_layout(margin=dict(l=20, r=20, t=20, b=20))
 
-        # Ordem fixa na faixa etária
         age_order = ["18-25", "26-35", "36-45", "46-60", "60+"]
         age = agg.get("age_distribution", {}) or {}
         age_vals = [int(age.get(cat, 0)) for cat in age_order]
@@ -1057,10 +1119,12 @@ def format_output_from_db(agg):
             paper_bgcolor='white'
         )
 
-        hourly_fig = create_hourly_flow_chart({})
-        gender_hourly_fig = create_gender_hourly_flow_chart(agg.get("hourly_gender_visits", {"male": {}, "female": {}}))
+        # Ajuste importante: usa hourly_visits do agregado, se existir.
+        hourly_fig = create_hourly_flow_chart(agg.get("hourly_visits", {}))
+        gender_hourly_fig = create_gender_hourly_flow_chart(
+            agg.get("hourly_gender_visits", {"male": {}, "female": {}})
+        )
 
-        # Média de idade vinda do DB: força inteiro
         avg_age_int = int(round(float(agg.get("avg_age", 0.0))))
         return (
             str(total),
@@ -1072,25 +1136,29 @@ def format_output_from_db(agg):
             age_fig,
             hourly_fig,
             gender_hourly_fig,
-            agg  # dados para a IA
+            agg
         )
     except Exception as e:
         print(f"Erro no format_output_from_db: {e}")
         return fallback_output()
 
 def fallback_output():
-    """Saída de fallback quando tudo falha"""
+    """Saída padrão usada quando não há dados nem da API nem do banco."""
     empty_fig = go.Figure()
-    empty_fig.add_annotation(text="Nenhum dado disponível", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+    empty_fig.add_annotation(
+        text="Nenhum dado disponível",
+        x=0.5, y=0.5,
+        xref="paper", yref="paper",
+        showarrow=False
+    )
     empty_fig.update_layout(plot_bgcolor='white', paper_bgcolor='white')
-    
+
     empty_metrics = {
         "total_visitors": 0, "total_men": 0, "total_women": 0, "avg_age": 0
     }
-    
+
     return ("0", "0", "0", "0 anos", empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_metrics)
 
-# apply_menu_styles callback
 @app.callback(
     Output('side-menu-panel', 'style'),
     Output('backdrop', 'style'),
@@ -1098,6 +1166,7 @@ def fallback_output():
     prevent_initial_call=True
 )
 def apply_menu_styles(state):
+    """Atualiza estilos do menu lateral e do backdrop conforme o estado aberto/fechado."""
     base = MENU_PANEL_BASE_STYLE.copy()
     open_state = bool((state or {}).get('open', False))
 
@@ -1114,7 +1183,7 @@ def apply_menu_styles(state):
     return base, backdrop
 
 # =======================================================
-# CALLBACKS DO CHAT IA
+# CALLBACKS DO CHAT
 # =======================================================
 @app.callback(
     Output("ai-offcanvas", "is_open"),
@@ -1123,10 +1192,11 @@ def apply_menu_styles(state):
     prevent_initial_call=True
 )
 def toggle_ai_chat(n_clicks, is_open):
+    """Abre/fecha o painel do assistente de dados."""
     return not is_open
 
 def generate_ai_response(question, metrics):
-    """Gera resposta da IA baseada nas métricas atuais"""
+    """Gera resposta baseada nas métricas atuais do dashboard."""
     if not metrics or metrics.get("total_visitors", 0) == 0:
         return "📊 Não há dados disponíveis no momento. Por favor, aplique os filtros primeiro para carregar as informações."
     
@@ -1139,21 +1209,19 @@ def generate_ai_response(question, metrics):
     hourly = metrics.get("hourly_visits", {})
     ages = metrics.get("age_distribution", {})
     
-    # Mapeamento de dias da semana
     days_map = {
         "Monday": "Segunda-feira", "Tuesday": "Terça-feira", "Wednesday": "Quarta-feira",
         "Thursday": "Quinta-feira", "Friday": "Sexta-feira", "Saturday": "Sábado", "Sunday": "Domingo"
     }
     
-    # Análise de intenção mais precisa
     if any(word in question_lower for word in ["total", "visitantes", "quantos", "pessoas", "quantidade"]):
         return f"👥 **Total de visitantes:** {total} pessoas"
     
-    elif any(word in question_lower for word in ["homem", "homens", "masculino", "homem"]):
+    elif any(word in question_lower for word in ["homem", "homens", "masculino"]):
         percent = (men / total * 100) if total > 0 else 0
         return f"👨 **Homens:** {men} pessoas ({percent:.1f}% do total)"
     
-    elif any(word in question_lower for word in ["mulher", "mulheres", "feminino", "mulher"]):
+    elif any(word in question_lower for word in ["mulher", "mulheres", "feminino"]):
         percent = (women / total * 100) if total > 0 else 0
         return f"👩 **Mulheres:** {women} pessoas ({percent:.1f}% do total)"
     
@@ -1175,7 +1243,7 @@ def generate_ai_response(question, metrics):
         else:
             return "📅 Não há dados de dias da semana disponíveis"
     
-    elif any(word in question_lower for word in ["horário", "hora", "pico", "movimento", "fluxo"]):
+    elif any(word in question_lower for word in ["horário", "hora", "pico", "fluxo"]):
         if hourly:
             peak_hour = max(hourly.items(), key=lambda x: x[1])
             return f"⏰ **Horário de pico:** {peak_hour[0]}h com {peak_hour[1]} visitantes"
@@ -1186,7 +1254,7 @@ def generate_ai_response(question, metrics):
         if ages:
             dominant_age = max(ages.items(), key=lambda x: x[1])
             dominant_pct = (dominant_age[1] / total * 100) if total > 0 else 0
-            return f"👥 **Faixa etária predominante:** {dominant_age[0]} anos com {dominant_age[1]} pessoas ({dominant_pct:.1f}%)"
+            return f"👥 **Faixa etária predominante:** {dominant_age[0]} anos com {dominant_pct:.1f}% dos visitantes"
         else:
             return "👥 Não há dados de faixa etária disponíveis"
     
@@ -1199,24 +1267,24 @@ def generate_ai_response(question, metrics):
 • Mulheres: {women} ({women_pct:.1f}%)
 • Média de idade: {avg_age} anos
 
-💡 **Posso ajudar com:** total, gênero, idade, dias da semana, horários ou faixas etárias."""
+Pode perguntar sobre total, gênero, idade, dias da semana, horários ou faixas etárias."""
     
     else:
         return """🤖 **Assistente de Dados**
         
-Posso ajudar com informações sobre:
+Posso ajudar com:
 
-• **Total** de visitantes
-• Distribuição por **gênero** 
-• **Média de idade**
-• Dias da **semana** com mais movimento
-• **Horários** de pico
-• **Faixas etárias** predominantes
+• Total de visitantes
+• Distribuição por gênero
+• Média de idade
+• Dias da semana com mais movimento
+• Horários de pico
+• Faixas etárias predominantes
 
-Exemplos: 
+Exemplos:
 "Quantos visitantes hoje?"
 "Qual a distribuição por gênero?"
-"Qual horário de pico?"""
+"Qual horário de pico?\""""
 
 @app.callback(
     Output("ai-chat-messages", "children"),
@@ -1228,43 +1296,47 @@ Exemplos:
     prevent_initial_call=True
 )
 def handle_ai_message(n_clicks, user_input, current_messages, metrics):
+    """Gerencia o histórico de mensagens do chat do assistente."""
     if not user_input or not user_input.strip():
         return current_messages or [], ""
     
-    # Mensagem de boas-vindas se for a primeira mensagem
     if not current_messages:
         welcome_msg = html.Div([
             html.Div([
                 html.Small("Assistente", className="text-muted"),
-                html.P("Olá! Sou seu assistente de dados. Posso ajudar com informações sobre visitantes, gênero, idade e muito mais. Como posso ajudar?", 
-                      className="mb-1 p-2 bg-light rounded",
-                      style={"maxWidth": "85%", "fontSize": "14px"})
+                html.P(
+                    "Olá! Sou seu assistente de dados. Posso ajudar com informações sobre visitantes, gênero, idade e muito mais. Como posso ajudar?",
+                    className="mb-1 p-2 bg-light rounded",
+                    style={"maxWidth": "85%", "fontSize": "14px"}
+                )
             ], className="text-start")
         ], className="mb-2")
         current_messages = [welcome_msg]
     
-    # Adiciona mensagem do usuário
     user_message = html.Div([
         html.Div([
             html.Small("Você", className="text-muted", style={"fontSize": "12px"}),
-            html.P(user_input, className="mb-1 p-2 bg-primary text-white rounded", 
-                  style={"maxWidth": "85%", "marginLeft": "auto", "fontSize": "14px"})
+            html.P(
+                user_input,
+                className="mb-1 p-2 bg-primary text-white rounded",
+                style={"maxWidth": "85%", "marginLeft": "auto", "fontSize": "14px"}
+            )
         ], className="text-end")
     ], className="mb-2")
     
-    # Gera resposta da IA
     ai_response = generate_ai_response(user_input, metrics or {})
     
-    # Adiciona resposta da IA
     ai_message = html.Div([
         html.Div([
             html.Small("Assistente", className="text-muted", style={"fontSize": "12px"}),
-            html.P(ai_response, className="mb-1 p-2 bg-light rounded",
-                  style={"maxWidth": "85%", "fontSize": "14px", "whiteSpace": "pre-line"})
+            html.P(
+                ai_response,
+                className="mb-1 p-2 bg-light rounded",
+                style={"maxWidth": "85%", "fontSize": "14px", "whiteSpace": "pre-line"}
+            )
         ], className="text-start")
     ], className="mb-2")
     
-    # Atualiza mensagens
     updated_messages = current_messages + [user_message, ai_message]
     
     return updated_messages, ""
